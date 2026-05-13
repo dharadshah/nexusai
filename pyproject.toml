@@ -1,0 +1,34 @@
+[tool.poetry]
+name = "nexusai"
+version = "0.1.0"
+description = "NexusAI: Intelligent Customer Interaction Platform"
+authors = ["Dhara"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.13,<4.0"
+fastapi = "*"
+uvicorn = {extras = ["standard"], version = "*"}
+sqlalchemy = "*"
+psycopg2-binary = "*"
+pydantic-settings = "*"
+python-dotenv = "*"
+twilio = "*"
+deepgram-sdk = "*"
+groq = "*"
+elevenlabs = "*"
+apscheduler = "*"
+websockets = "*"
+httpx = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+pytest-asyncio = "*"
+httpx = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
