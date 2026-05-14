@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.database import Base, engine
+import app.models  # noqa: F401 — registers all models with Base.metadata
 
 
 @asynccontextmanager
