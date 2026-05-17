@@ -46,7 +46,32 @@ class CustomerStatus:
     DO_NOT_CALL = "do_not_call"
 
 
+class Intent:
+    PAYMENT_CONFIRMED = "payment_confirmed"
+    PAYMENT_DECLINED = "payment_declined"
+    CALLBACK_REQUESTED = "callback_requested"
+    ESCALATION_REQUESTED = "escalation_requested"
+    QUESTION_ASKED = "question_asked"
+    END_CALL = "end_call"
+    POSITIVE_RESPONSE = "positive_response"
+    NEGATIVE_RESPONSE = "negative_response"
+    UNCLEAR = "unclear"
+
+    ALL = [
+        PAYMENT_CONFIRMED,
+        PAYMENT_DECLINED,
+        CALLBACK_REQUESTED,
+        ESCALATION_REQUESTED,
+        QUESTION_ASKED,
+        END_CALL,
+        POSITIVE_RESPONSE,
+        NEGATIVE_RESPONSE,
+        UNCLEAR,
+    ]
+
+
 MAX_CALL_RETRIES = 3
 MAX_CALL_DURATION_SECONDS = 300
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
+MAX_CONVERSATION_TURNS = 10
