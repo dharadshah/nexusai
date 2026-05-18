@@ -6,13 +6,15 @@ from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketD
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app.models.call_record import CallRecord
+from app.models.customer import Customer
+from app.models.campaign import Campaign
 from app.services.twilio_service import generate_stream_twiml
-from app.services.deepgram_service import (
-    DeepgramTranscriber,
-    register_transcriber,
-    unregister_transcriber,
+from app.agents.call_agent import (
+    build_conversation_engine,
+    register_agent,
+    unregister_agent,
 )
 from app.utils.audio_utils import decode_mulaw_audio
 from app.constants.app_constants import CallStatus, CallOutcome
@@ -30,15 +32,8 @@ async def call_answered(
     customer_name: str = "Valued Customer",
     db: Session = Depends(get_db),
 ):
-    """
-    Twilio calls this when customer picks up.
-    Returns TwiML that immediately opens Media Stream.
-    ElevenLabs greeting is sent over WebSocket in Phase 8.
-    """
     form_data = await request.form()
     call_sid = form_data.get("CallSid", "")
-
-    logger.info(f"Call answered: SID={call_sid} call_record_id={call_record_id}")
     print(f"[Webhook] Call answered: SID={call_sid}")
 
     call_record = db.query(CallRecord).filter(
@@ -52,7 +47,6 @@ async def call_answered(
             call_record.twilio_call_sid = call_sid
         db.commit()
 
-    # Return TwiML — just open the Media Stream, no Alice
     twiml = generate_stream_twiml(call_record_id=call_record_id)
     return Response(content=twiml, media_type="application/xml")
 
@@ -77,7 +71,6 @@ async def call_status_callback(
     ).first()
 
     if not call_record:
-        logger.warning(f"No call record found for SID: {call_sid}")
         return {"status": "not_found"}
 
     status_map = {
@@ -97,19 +90,16 @@ async def call_status_callback(
 
     if call_status == "completed":
         call_record.ended_at = datetime.utcnow()
-        call_record.outcome = CallOutcome.COMPLETED
+        if not call_record.outcome or call_record.outcome == CallOutcome.UNRESOLVED:
+            call_record.outcome = CallOutcome.COMPLETED
         if call_duration:
             call_record.duration_seconds = int(call_duration)
     elif call_status in ("busy", "no-answer", "failed"):
         call_record.ended_at = datetime.utcnow()
         call_record.outcome = CallOutcome.UNRESOLVED
-        call_record.error_message = f"Call ended with Twilio status: {call_status}"
+        call_record.error_message = f"Call ended with status: {call_status}"
 
     db.commit()
-    logger.info(
-        f"Call record {call_record.id} updated: "
-        f"status={new_status} duration={call_duration}"
-    )
     return {"status": "ok"}
 
 
@@ -122,8 +112,6 @@ async def call_completed(
     call_sid = form_data.get("CallSid", "")
     call_duration = form_data.get("CallDuration", 0)
 
-    logger.info(f"Call completed: SID={call_sid} duration={call_duration}s")
-
     call_record = db.query(CallRecord).filter(
         CallRecord.twilio_call_sid == call_sid
     ).first()
@@ -132,7 +120,8 @@ async def call_completed(
         call_record.status = CallStatus.COMPLETED
         call_record.ended_at = datetime.utcnow()
         call_record.duration_seconds = int(call_duration)
-        call_record.outcome = CallOutcome.COMPLETED
+        if not call_record.outcome or call_record.outcome == CallOutcome.UNRESOLVED:
+            call_record.outcome = CallOutcome.COMPLETED
         db.commit()
 
     return {"status": "ok"}
@@ -144,32 +133,47 @@ async def media_stream(
     call_record_id: str,
 ):
     """
-    WebSocket endpoint that receives Twilio audio stream.
-    Forwards audio to Deepgram for STT.
-    ElevenLabs audio playback is added in Phase 8.
+    WebSocket endpoint — full ConversationEngine loop.
+    STT (Deepgram) + LLM (Groq) + TTS (OpenAI) all wired together.
     """
     await websocket.accept()
     print(f"[Webhook] Media stream opened for call {call_record_id}")
 
-    transcripts: list[str] = []
-
-    async def on_interim(text: str):
-        print(f"[Deepgram] interim [{call_record_id}]: \"{text}\"")
-
-    async def on_final(text: str):
-        print(f"[Deepgram] final [{call_record_id}]: \"{text}\"")
-        transcripts.append(text)
-
-    transcriber = DeepgramTranscriber(
-        call_record_id=call_record_id,
-        on_interim_transcript=on_interim,
-        on_final_transcript=on_final,
-    )
-    register_transcriber(call_record_id, transcriber)
+    db = SessionLocal()
 
     try:
-        await transcriber.start()
-        print(f"[Deepgram] Ready for call {call_record_id}")
+        call_record = db.query(CallRecord).filter(
+            CallRecord.id == call_record_id
+        ).first()
+
+        if not call_record:
+            print(f"[Webhook] Call record not found: {call_record_id}")
+            await websocket.close()
+            return
+
+        customer = db.query(Customer).filter(
+            Customer.id == call_record.customer_id
+        ).first()
+
+        campaign = db.query(Campaign).filter(
+            Campaign.id == call_record.campaign_id
+        ).first()
+
+        if not customer or not campaign:
+            print(f"[Webhook] Customer or campaign not found")
+            await websocket.close()
+            return
+
+        engine = build_conversation_engine(
+            call_record_id=call_record_id,
+            customer=customer,
+            campaign=campaign,
+            websocket=websocket,
+            db=db,
+        )
+        register_agent(call_record_id, engine)
+
+        await engine.start()
 
         async for raw_message in websocket.iter_text():
             try:
@@ -181,23 +185,25 @@ async def media_stream(
 
                 elif event == "start":
                     stream_sid = data.get("streamSid", "")
-                    print(
-                        f"[Twilio] Stream started: "
-                        f"streamSid={stream_sid} call={call_record_id}"
-                    )
+                    engine.set_stream_sid(stream_sid)
+                    print(f"[Twilio] Stream started: streamSid={stream_sid}")
 
                 elif event == "media":
                     payload = data.get("media", {}).get("payload", "")
                     if payload:
                         audio_bytes = decode_mulaw_audio(payload)
-                        await transcriber.send_audio(audio_bytes)
+                        await engine.process_audio(audio_bytes)
+
+                elif event == "mark":
+                    mark_name = data.get("mark", {}).get("name", "")
+                    print(f"[Twilio] Mark: {mark_name}")
 
                 elif event == "stop":
                     print(f"[Twilio] Stream stopped for call {call_record_id}")
                     break
 
             except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error in media stream: {e}")
+                logger.error(f"JSON decode error: {e}")
                 continue
 
     except WebSocketDisconnect:
@@ -206,9 +212,10 @@ async def media_stream(
         logger.error(f"Media stream error for call {call_record_id}: {e}")
         print(f"[Webhook] ERROR: {e}")
     finally:
-        await transcriber.stop()
-        unregister_transcriber(call_record_id)
-        print(
-            f"[Webhook] Media stream closed for call {call_record_id}. "
-            f"Total transcripts: {len(transcripts)}"
-        )
+        if 'engine' in locals():
+            await engine.stop()
+            summary = engine.get_transcript_summary()
+            print(f"[Webhook] Call ended. Total turns: {len(summary)}")
+        unregister_agent(call_record_id)
+        db.close()
+        print(f"[Webhook] Media stream closed for call {call_record_id}")

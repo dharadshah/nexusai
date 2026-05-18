@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class DeepgramTranscriber:
     """
     Manages a real-time streaming STT connection to Deepgram v7.
-    Receives raw mulaw audio from Twilio and returns transcripts.
+    Sends keepalive messages while agent is speaking to prevent timeout.
     """
 
     def __init__(
@@ -28,7 +28,9 @@ class DeepgramTranscriber:
         self.on_final_transcript = on_final_transcript
         self._socket: Optional[AsyncV1SocketClient] = None
         self._context_manager = None
+        self._keepalive_task: Optional[asyncio.Task] = None
         self.is_connected = False
+        self.is_paused = False  # True while agent is speaking
         self._client = None
 
     async def start(self):
@@ -56,41 +58,71 @@ class DeepgramTranscriber:
             self._socket = await self._context_manager.__aenter__()
             print(f"[Deepgram] Socket created: {self._socket} for call {self.call_record_id}")
 
-            # Register event handlers
             self._socket.on(EventType.MESSAGE, self._on_message)
             self._socket.on(EventType.ERROR, self._on_error)
             self._socket.on(EventType.CLOSE, self._on_close)
 
-            # Start the listening loop in the background
             asyncio.create_task(self._socket.start_listening())
             print(f"[Deepgram] Listening task created for call {self.call_record_id}")
+
+            # Start keepalive background task
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
             self.is_connected = True
             print(f"[Deepgram] Ready — is_connected=True for call {self.call_record_id}")
 
         except Exception as e:
             print(f"[Deepgram] START ERROR for call {self.call_record_id}: {e}")
-            logger.error(
-                f"Deepgram start error for call {self.call_record_id}: {e}"
-            )
+            logger.error(f"Deepgram start error: {e}")
             raise
+
+    async def _keepalive_loop(self):
+        """
+        Send keepalive every 8 seconds while agent is speaking
+        to prevent Deepgram from closing the connection due to silence.
+        """
+        while self.is_connected:
+            await asyncio.sleep(8)
+            if self.is_connected and self.is_paused and self._socket:
+                try:
+                    await self._socket.send_keep_alive()
+                    print(f"[Deepgram] Keepalive sent for call {self.call_record_id}")
+                except Exception as e:
+                    logger.error(f"Deepgram keepalive error: {e}")
 
     async def send_audio(self, audio_bytes: bytes):
         """
         Send raw mulaw audio bytes to Deepgram for transcription.
         """
-        if self._socket and self.is_connected:
+        if self._socket and self.is_connected and not self.is_paused:
             try:
                 await self._socket.send_media(audio_bytes)
             except Exception as e:
                 print(f"[Deepgram] send audio error: {e}")
                 logger.error(f"Deepgram send audio error: {e}")
 
+    def pause(self):
+        """
+        Pause audio forwarding while agent is speaking.
+        Keepalive loop will maintain the connection.
+        """
+        self.is_paused = True
+        print(f"[Deepgram] Paused for call {self.call_record_id}")
+
+    def resume(self):
+        """
+        Resume audio forwarding after agent finishes speaking.
+        """
+        self.is_paused = False
+        print(f"[Deepgram] Resumed for call {self.call_record_id}")
+
     async def stop(self):
         """
         Close the Deepgram connection cleanly.
         """
         print(f"[Deepgram] Stopping for call {self.call_record_id}")
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
         if self._socket and self.is_connected:
             try:
                 await self._socket.send_close_stream()
@@ -103,9 +135,6 @@ class DeepgramTranscriber:
                 logger.error(f"Deepgram stop error: {e}")
 
     def _on_message(self, message):
-        """
-        Handle incoming transcript messages from Deepgram.
-        """
         try:
             print(f"[Deepgram] Message received: {type(message).__name__}")
             if not isinstance(message, ListenV1Results):
@@ -125,18 +154,13 @@ class DeepgramTranscriber:
 
             if is_final:
                 print(f"[Deepgram] FINAL [{self.call_record_id}]: \"{transcript}\"")
-                logger.info(
-                    f"Deepgram final [{self.call_record_id}]: \"{transcript}\""
-                )
+                logger.info(f"Deepgram final [{self.call_record_id}]: \"{transcript}\"")
                 if self.on_final_transcript:
                     asyncio.create_task(
                         self._safe_callback(self.on_final_transcript, transcript)
                     )
             else:
                 print(f"[Deepgram] interim [{self.call_record_id}]: \"{transcript}\"")
-                logger.info(
-                    f"Deepgram interim [{self.call_record_id}]: \"{transcript}\""
-                )
                 if self.on_interim_transcript:
                     asyncio.create_task(
                         self._safe_callback(self.on_interim_transcript, transcript)
@@ -148,22 +172,15 @@ class DeepgramTranscriber:
 
     def _on_error(self, error):
         print(f"[Deepgram] ERROR [{self.call_record_id}]: {error}")
-        logger.error(
-            f"Deepgram error for call {self.call_record_id}: {error}"
-        )
+        logger.error(f"Deepgram error for call {self.call_record_id}: {error}")
         self.is_connected = False
 
     def _on_close(self, event):
         print(f"[Deepgram] CLOSED [{self.call_record_id}]")
-        logger.info(
-            f"Deepgram connection closed for call {self.call_record_id}"
-        )
+        logger.info(f"Deepgram connection closed for call {self.call_record_id}")
         self.is_connected = False
 
     async def _safe_callback(self, callback: Callable, *args):
-        """
-        Call a callback safely — handles both sync and async callbacks.
-        """
         try:
             if asyncio.iscoroutinefunction(callback):
                 await callback(*args)
@@ -174,7 +191,7 @@ class DeepgramTranscriber:
             logger.error(f"Deepgram callback error: {e}")
 
 
-# Registry of active transcribers keyed by call_record_id
+# Registry of active transcribers
 _active_transcribers: dict[str, DeepgramTranscriber] = {}
 
 
@@ -182,10 +199,7 @@ def get_transcriber(call_record_id: str) -> Optional[DeepgramTranscriber]:
     return _active_transcribers.get(call_record_id)
 
 
-def register_transcriber(
-    call_record_id: str,
-    transcriber: DeepgramTranscriber,
-):
+def register_transcriber(call_record_id: str, transcriber: DeepgramTranscriber):
     _active_transcribers[call_record_id] = transcriber
     print(f"[Deepgram] Transcriber registered for call {call_record_id}")
 

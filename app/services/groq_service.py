@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Groq model to use — fastest available with strong reasoning
 GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_MAX_TOKENS = 200  # Keep responses short for phone calls
+GROQ_MAX_TOKENS = 80  # Keep responses short for phone calls
 GROQ_TEMPERATURE = 0.7
 
 
@@ -225,11 +225,14 @@ class GroqConversationEngine:
         Determine if the call should be ended based on:
         - Current intent
         - Number of turns taken
+
+        payment_declined alone does NOT end the call — the agent
+        should try to reschedule. Only end on explicit goodbye,
+        payment confirmed, or after max turns.
         """
         end_intents = {
             Intent.END_CALL,
             Intent.PAYMENT_CONFIRMED,
-            Intent.PAYMENT_DECLINED,
         }
 
         if self.last_intent in end_intents:
