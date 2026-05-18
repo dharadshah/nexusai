@@ -110,4 +110,4 @@ async def test_detect_intent_live():
     )
     assert result["intent"] in Intent.ALL
     assert result["confidence"] in ["high", "medium", "low"]
-    print(f"\nIntent result: {result}")
+    print(f"\nIntent result: {result}") 

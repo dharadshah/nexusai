@@ -26,7 +26,6 @@ def initiate_call(
 
     status_callback_url = f"{settings.base_url}/webhooks/call-status"
 
-    # URL-encode customer_name to handle spaces and special characters
     answered_url = (
         f"{settings.base_url}/webhooks/call-answered"
         f"?call_record_id={call_record_id}"
@@ -51,46 +50,29 @@ def initiate_call(
         raise
 
 
-def generate_greeting_twiml(
-    customer_name: str,
-    campaign_message: str,
-    call_record_id: str,
-) -> str:
+def generate_stream_twiml(call_record_id: str) -> str:
     """
-    Generate TwiML that:
-    1. Greets the customer with Alice's voice
-    2. Opens a Media Stream WebSocket so we can hear the customer speak
-    This enables real-time STT via Deepgram in Phase 5+
+    Generate TwiML that immediately opens a Media Stream WebSocket.
+    No Alice greeting — ElevenLabs will speak the opening greeting
+    as the first audio sent over the WebSocket in Phase 8.
     """
     response = VoiceResponse()
-
-    # Greet the customer
-    response.say(
-        f"Hello {customer_name}. {campaign_message}",
-        voice="alice",
-        language="en-IN",
-    )
-    response.pause(length=1)
-
-    # Open Media Stream — Twilio will stream audio to our WebSocket
     connect = Connect()
     stream = Stream(
-        url=f"wss://{settings.base_url.replace('https://', '')}"
+        url=(
+            f"wss://{settings.base_url.replace('https://', '')}"
             f"/webhooks/media-stream/{call_record_id}"
+        )
     )
     connect.append(stream)
     response.append(connect)
-
     return str(response)
 
 
-def generate_voicemail_twiml(
-    customer_name: str,
-    campaign_message: str,
-    call_record_id: str = "",
-) -> str:
+def generate_voicemail_twiml(customer_name: str, campaign_message: str) -> str:
     """
     TwiML for when call goes to voicemail.
+    Still uses Alice here since Media Stream is not available on voicemail.
     """
     response = VoiceResponse()
     response.say(

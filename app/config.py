@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 
+
 class Settings(BaseSettings):
     app_name: str = "NexusAI"
     app_version: str = "0.1.0"
@@ -15,8 +16,9 @@ class Settings(BaseSettings):
 
     groq_api_key: str
 
-    elevenlabs_api_key: str
-    elevenlabs_voice_id: str = "EXAVITQu4vr4xnSDxMaL"
+    openai_api_key: str
+    openai_tts_voice: str = "nova"
+    openai_tts_model: str = "tts-1"
 
     base_url: str = "https://your-ngrok-or-domain.com"
 

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.call_record import CallRecord
-from app.services.twilio_service import generate_greeting_twiml
+from app.services.twilio_service import generate_stream_twiml
 from app.services.deepgram_service import (
     DeepgramTranscriber,
     register_transcriber,
@@ -22,11 +22,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
-DEFAULT_CAMPAIGN_MESSAGE = (
-    "This is NexusAI calling on behalf of your service provider. "
-    "We have an important update for you."
-)
-
 
 @router.post("/call-answered", response_class=PlainTextResponse)
 async def call_answered(
@@ -35,10 +30,16 @@ async def call_answered(
     customer_name: str = "Valued Customer",
     db: Session = Depends(get_db),
 ):
+    """
+    Twilio calls this when customer picks up.
+    Returns TwiML that immediately opens Media Stream.
+    ElevenLabs greeting is sent over WebSocket in Phase 8.
+    """
     form_data = await request.form()
     call_sid = form_data.get("CallSid", "")
 
     logger.info(f"Call answered: SID={call_sid} call_record_id={call_record_id}")
+    print(f"[Webhook] Call answered: SID={call_sid}")
 
     call_record = db.query(CallRecord).filter(
         CallRecord.id == call_record_id
@@ -51,11 +52,8 @@ async def call_answered(
             call_record.twilio_call_sid = call_sid
         db.commit()
 
-    twiml = generate_greeting_twiml(
-        customer_name=customer_name,
-        campaign_message=DEFAULT_CAMPAIGN_MESSAGE,
-        call_record_id=call_record_id,
-    )
+    # Return TwiML — just open the Media Stream, no Alice
+    twiml = generate_stream_twiml(call_record_id=call_record_id)
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -146,19 +144,20 @@ async def media_stream(
     call_record_id: str,
 ):
     """
-    WebSocket endpoint that receives Twilio's audio stream.
-    Forwards audio to Deepgram for real-time STT.
+    WebSocket endpoint that receives Twilio audio stream.
+    Forwards audio to Deepgram for STT.
+    ElevenLabs audio playback is added in Phase 8.
     """
     await websocket.accept()
-    logger.info(f"Media stream WebSocket opened for call {call_record_id}")
+    print(f"[Webhook] Media stream opened for call {call_record_id}")
 
     transcripts: list[str] = []
 
     async def on_interim(text: str):
-        logger.info(f"Deepgram interim [{call_record_id}]: \"{text}\"")
+        print(f"[Deepgram] interim [{call_record_id}]: \"{text}\"")
 
     async def on_final(text: str):
-        logger.info(f"Deepgram final [{call_record_id}]: \"{text}\"")
+        print(f"[Deepgram] final [{call_record_id}]: \"{text}\"")
         transcripts.append(text)
 
     transcriber = DeepgramTranscriber(
@@ -169,26 +168,22 @@ async def media_stream(
     register_transcriber(call_record_id, transcriber)
 
     try:
-        # Start Deepgram connection — must happen before any audio arrives
         await transcriber.start()
-        logger.info(f"Deepgram ready for call {call_record_id}")
+        print(f"[Deepgram] Ready for call {call_record_id}")
 
-        # Process incoming Twilio messages
         async for raw_message in websocket.iter_text():
             try:
                 data = json.loads(raw_message)
                 event = data.get("event", "")
 
                 if event == "connected":
-                    logger.info(
-                        f"Twilio Media Stream connected for call {call_record_id}"
-                    )
+                    print(f"[Twilio] Stream connected for call {call_record_id}")
 
                 elif event == "start":
                     stream_sid = data.get("streamSid", "")
-                    logger.info(
-                        f"Twilio stream started: streamSid={stream_sid} "
-                        f"call={call_record_id}"
+                    print(
+                        f"[Twilio] Stream started: "
+                        f"streamSid={stream_sid} call={call_record_id}"
                     )
 
                 elif event == "media":
@@ -198,9 +193,7 @@ async def media_stream(
                         await transcriber.send_audio(audio_bytes)
 
                 elif event == "stop":
-                    logger.info(
-                        f"Twilio stream stopped for call {call_record_id}"
-                    )
+                    print(f"[Twilio] Stream stopped for call {call_record_id}")
                     break
 
             except json.JSONDecodeError as e:
@@ -208,15 +201,14 @@ async def media_stream(
                 continue
 
     except WebSocketDisconnect:
-        logger.info(
-            f"Media stream WebSocket disconnected for call {call_record_id}"
-        )
+        print(f"[Webhook] WebSocket disconnected for call {call_record_id}")
     except Exception as e:
         logger.error(f"Media stream error for call {call_record_id}: {e}")
+        print(f"[Webhook] ERROR: {e}")
     finally:
         await transcriber.stop()
         unregister_transcriber(call_record_id)
-        logger.info(
-            f"Media stream closed for call {call_record_id}. "
-            f"Total final transcripts: {len(transcripts)}"
+        print(
+            f"[Webhook] Media stream closed for call {call_record_id}. "
+            f"Total transcripts: {len(transcripts)}"
         )
